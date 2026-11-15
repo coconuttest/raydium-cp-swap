@@ -2248,3 +2248,107 @@ mod seed_index_tests {
         assert_ne!(seeded, legacy);
     }
 }
+
+#[cfg(test)]
+mod bitmap_diff_test {
+    use super::*;
+    use crate::libraries::tick_math;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    const SPACINGS: [u16; 14] = [1, 2, 3, 4, 5, 8, 10, 12, 14, 15, 16, 30, 60, 200];
+
+    fn range_of(spacing: u16) -> (i32, i32, i32) {
+        (
+            TickArrayState::get_array_start_index(tick_math::MIN_TICK, spacing),
+            TickArrayState::get_array_start_index(tick_math::MAX_TICK, spacing),
+            TickArrayState::tick_count(spacing),
+        )
+    }
+
+    /// starts near every bitmap boundary (multiples of B) plus the extremes
+    fn boundary_starts(spacing: u16) -> Vec<i32> {
+        let (mn, mx, c) = range_of(spacing);
+        let b = tick_array_bit_map::max_tick_in_tickarray_bitmap(spacing);
+        let mut v = vec![mn, mx, mn + c, mx - c, 0, c, -c];
+        for j in 0..=16i32 {
+            for d in -2..=2i32 {
+                for sign in [-1i32, 1] {
+                    let s = (sign as i64) * (j as i64) * (b as i64) + (d as i64) * (c as i64);
+                    if s >= mn as i64 && s <= mx as i64 {
+                        v.push(s as i32);
+                    }
+                }
+            }
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn pick(spacing: u16, raw: u64, boundary: bool) -> i32 {
+        let (mn, mx, c) = range_of(spacing);
+        if boundary {
+            let bs = boundary_starts(spacing);
+            bs[(raw as usize) % bs.len()]
+        } else {
+            let n = ((mx - mn) / c + 1) as u64;
+            mn + ((raw % n) as i32) * c
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(3000))]
+        #[test]
+        fn bitmap_matches_naive_model(
+            si in 0usize..SPACINGS.len(),
+            inits in proptest::collection::vec((any::<u64>(), any::<bool>()), 0..24),
+            queries in proptest::collection::vec((any::<u64>(), any::<bool>(), any::<bool>()), 1..24),
+            ticks in proptest::collection::vec((any::<i32>(), any::<bool>(), any::<bool>()), 1..8),
+        ) {
+            let spacing = SPACINGS[si];
+            let (mn, mx, _c) = range_of(spacing);
+            let mut pool = PoolState::default();
+            pool.tick_spacing = spacing;
+            let mut ext = TickArrayBitmapExtension::default();
+            let mut model: BTreeSet<i32> = BTreeSet::new();
+            for (raw, b) in inits {
+                let s = pick(spacing, raw, b);
+                if !model.insert(s) { continue; }
+                if pool.is_overflow_default_tickarray_bitmap(vec![s]) {
+                    ext.flip_tick_array_bit(s, spacing).unwrap();
+                } else {
+                    pool.flip_tick_array_bit_default(s).unwrap();
+                }
+            }
+            let ext_opt = Some(ext);
+            for (raw, b, zfo) in queries {
+                let last = pick(spacing, raw, b);
+                let expected = if zfo { model.range(..last).next_back().copied() }
+                               else { model.range(last + 1..).next().copied() };
+                let got = pool.next_initialized_tick_array_start_index(&ext_opt, last, zfo);
+                prop_assert_eq!(got.ok().flatten(), expected,
+                    "spacing={} last={} zfo={} model={:?}", spacing, last, zfo, model);
+            }
+            for (t, edge, zfo) in ticks {
+                let tick = if edge {
+                    [tick_math::MIN_TICK, tick_math::MAX_TICK, 0, -1, 1][(t.unsigned_abs() as usize) % 5]
+                } else {
+                    tick_math::MIN_TICK + (t.unsigned_abs() as i64 % (tick_math::MAX_TICK as i64 - tick_math::MIN_TICK as i64 + 1)) as i32
+                };
+                let s0 = TickArrayState::get_array_start_index(tick, spacing);
+                prop_assert!(s0 >= mn && s0 <= mx);
+                pool.tick_current = tick;
+                let expected: Option<(bool, i32)> = if model.contains(&s0) { Some((true, s0)) }
+                    else {
+                        let nx = if zfo { model.range(..s0).next_back().copied() }
+                                 else { model.range(s0 + 1..).next().copied() };
+                        nx.map(|x| (false, x))
+                    };
+                let got = pool.get_first_initialized_tick_array(&ext_opt, zfo).ok();
+                prop_assert_eq!(got, expected,
+                    "spacing={} tick={} zfo={} model={:?}", spacing, tick, zfo, model);
+            }
+        }
+    }
+}
